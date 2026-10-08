@@ -129,7 +129,7 @@ public:
 
 	// Thread safe: completion handlers run on Metal's own threads.
 	void accumulate(const char *tag, double seconds);
-	void report(pyrowave_message_cb cb, void *userdata, bool reset);
+	void report(pyrowave_double_cb cb, void *userdata, bool reset);
 
 	// For TimestampBatch.
 	id<MTLCounterSampleBuffer> acquire_sample_buffer();

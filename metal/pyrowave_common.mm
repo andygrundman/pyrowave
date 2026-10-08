@@ -257,7 +257,7 @@ void DeviceTimestamps::accumulate(const char *tag, double seconds)
 	entry.iterations++;
 }
 
-void DeviceTimestamps::report(pyrowave_message_cb cb, void *userdata, bool reset)
+void DeviceTimestamps::report(pyrowave_double_cb cb, void *userdata, bool reset)
 {
 	// Snapshot, so the callback does not run under the lock.
 	std::map<std::string, Entry> snapshot;
@@ -273,20 +273,23 @@ void DeviceTimestamps::report(pyrowave_message_cb cb, void *userdata, bool reset
 
 	for (auto &entry : snapshot)
 	{
-		char msg[256];
-		snprintf(msg, sizeof(msg), "%s: %.3f ms per iteration (%llu iterations)",
-		         entry.first.c_str(),
-		         1e3 * entry.second.total_time / double(entry.second.iterations),
-		         static_cast<unsigned long long>(entry.second.iterations));
-		cb(userdata, msg);
+		// char msg[256];
+		// snprintf(msg, sizeof(msg), "%s: %.3f ms per iteration (%llu iterations)",
+		//          entry.first.c_str(),
+		//          1e3 * entry.second.total_time / double(entry.second.iterations),
+		//          static_cast<unsigned long long>(entry.second.iterations));
+		// cb(userdata, msg);
+
+		double elapsed = 1e3 * entry.second.total_time / double(entry.second.iterations);
+		cb(userdata, elapsed);
 	}
 
 	if (snapshot.empty())
 	{
-		cb(userdata, was_collecting ?
-		             "No GPU timings have been collected yet." :
-		             "GPU timing was off. It is now on; figures appear after the next "
-		             "encode or decode completes.");
+		// cb(userdata, was_collecting ?
+		//              "No GPU timings have been collected yet." :
+		//              "GPU timing was off. It is now on; figures appear after the next "
+		//              "encode or decode completes.");
 	}
 }
 
@@ -534,37 +537,37 @@ pyrowave_result pyrowave_device_create(const pyrowave_device_create_info *info, 
 	}
 }
 
-void pyrowave_device_report_performance_stats(pyrowave_device device, pyrowave_message_cb cb, void *userdata, bool reset)
+void pyrowave_device_report_performance_stats(pyrowave_device device, pyrowave_double_cb cb, void *userdata, bool reset)
 {
 	if (!device)
 		return;
 
-	if (!cb)
-	{
-		cb = log_to_device;
-		userdata = device;
-	}
+	// if (!cb)
+	// {
+	// 	cb = log_to_device;
+	// 	userdata = device;
+	// }
 
 	device->timestamps->report(cb, userdata, reset);
 
-	if (!device->timestamps->counters_supported())
-		cb(userdata, "GPU pass timestamps are not supported by this device.");
+	// if (!device->timestamps->counters_supported())
+	// 	cb(userdata, "GPU pass timestamps are not supported by this device.");
 
-	@autoreleasepool
-	{
-		// Metal has no per heap budget like VK_EXT_memory_budget, only this
-		// process's allocation total against the recommended working set.
-		if (@available(macOS 10.15, iOS 16.0, tvOS 16.0, *))
-		{
-			char msg[256];
-			snprintf(msg, sizeof(msg),
-			         "Memory (%s): CurrentAllocated %.3f MiB, RecommendedMaxWorkingSet %.3f MiB",
-			         device->mtl.hasUnifiedMemory ? "unified" : "discrete",
-			         double(device->mtl.currentAllocatedSize) / (1024.0 * 1024.0),
-			         double(device->mtl.recommendedMaxWorkingSetSize) / (1024.0 * 1024.0));
-			cb(userdata, msg);
-		}
-	}
+	// @autoreleasepool
+	// {
+	// 	// Metal has no per heap budget like VK_EXT_memory_budget, only this
+	// 	// process's allocation total against the recommended working set.
+	// 	if (@available(macOS 10.15, iOS 16.0, tvOS 16.0, *))
+	// 	{
+	// 		char msg[256];
+	// 		snprintf(msg, sizeof(msg),
+	// 		         "Memory (%s): CurrentAllocated %.3f MiB, RecommendedMaxWorkingSet %.3f MiB",
+	// 		         device->mtl.hasUnifiedMemory ? "unified" : "discrete",
+	// 		         double(device->mtl.currentAllocatedSize) / (1024.0 * 1024.0),
+	// 		         double(device->mtl.recommendedMaxWorkingSetSize) / (1024.0 * 1024.0));
+	// 		cb(userdata, msg);
+	// 	}
+	// }
 }
 
 void pyrowave_device_destroy(pyrowave_device device)

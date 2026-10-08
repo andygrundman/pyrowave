@@ -71,6 +71,7 @@ typedef struct pyrowave_decoder_opaque *pyrowave_decoder;
 typedef struct pyrowave_encoder_opaque *pyrowave_encoder;
 
 typedef void (*pyrowave_message_cb)(void *userdata, const char *msg);
+typedef void (*pyrowave_double_cb)(void *userdata, double val);
 
 // Used to dynamically detect any API/ABI incompatibility. This entry point is stable.
 PYROWAVE_PUBLIC_API void
@@ -121,7 +122,7 @@ pyrowave_device_destroy(pyrowave_device device);
 // set or this is called once, so the first call may have nothing to report yet.
 // cb may be NULL, in which case the device's message callback is used.
 PYROWAVE_PUBLIC_API void
-pyrowave_device_report_performance_stats(pyrowave_device device, pyrowave_message_cb cb, void *userdata, bool reset);
+pyrowave_device_report_performance_stats(pyrowave_device device, pyrowave_double_cb cb, void *userdata, bool reset);
 
 // Encoder API
 typedef struct pyrowave_encoder_create_info
