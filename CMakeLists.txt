@@ -152,8 +152,11 @@ if (${PROJECT_IS_TOP_LEVEL})
 
     set_target_properties(pyrowave-shared
             PROPERTIES VERSION ${PYROWAVE_API_VERSION}
-            SOVERSION ${PYROWAVE_API_VERSION_MAJOR}
-            DLL_NAME_WITH_SOVERSION ON)
+            SOVERSION ${PYROWAVE_API_VERSION_MAJOR})
+
+    if (WIN32)
+        set_target_properties(pyrowave-shared PROPERTIES DLL_NAME_WITH_SOVERSION ON)
+    endif()
 
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/pyrowave.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pyrowave)
     install(TARGETS pyrowave-shared EXPORT pyrowave-sharedConfig
@@ -214,3 +217,11 @@ if (PYROWAVE_DEVEL AND WIN32)
     target_link_libraries(pyrowave-encode-desktop PRIVATE pyrowave-shared dxgi d3d11 pyrowave-utils)
 endif()
 
+
+# Native Direct3D 12 backend (no Granite/Vulkan), see d3d12/.
+if (WIN32)
+    option(PYROWAVE_D3D12 "Build the Direct3D 12 backend in d3d12/." ON)
+    if (PYROWAVE_D3D12)
+        add_subdirectory(d3d12)
+    endif()
+endif()

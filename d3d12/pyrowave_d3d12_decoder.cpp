@@ -1,0 +1,810 @@
+// Copyright (c) 2026 Hans-Kristian Arntzen
+// SPDX-License-Identifier: MIT
+
+// D3D12 backend for the PyroWave decoder. Mirrors the compute path of
+// pyrowave_decoder.cpp by way of the Metal port (metal/pyrowave_decoder.mm), whose
+// bitstream layer is shared verbatim.
+//
+// Resource state model: the wavelet pyramid is a simultaneous-access (uncompressed)
+// texture resting in COMMON between decodes. Dequant writes it as UAV; the iDWT then walks
+// the levels from coarsest to finest, transitioning one mip at a time to
+// NON_PIXEL_SHADER_RESOURCE right before it is sampled (which also makes the LL band
+// the previous level wrote visible), and everything is returned to COMMON at the end.
+
+#include "pyrowave_d3d12_internal.hpp"
+
+#include <memory>
+#include <new>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+using namespace PyroWave;
+using namespace PyroWave::D3D12;
+
+namespace
+{
+// Root constant layouts. These must match the cbuffer Registers declarations
+// SPIRV-Cross emitted into shaders/hlsl/*.hlsl.
+struct DequantPush
+{
+	int32_t resolution[2];
+	int32_t output_layer;
+	int32_t block_offset_32x32;
+	int32_t block_stride_32x32;
+	// Xbox kernels: leave empty blocks unwritten; the iDWT checks for them.
+	uint32_t skip_empty_blocks;
+};
+
+// Levels whose empty blocks the Xbox kernels skip rather than zero. At the rates
+// moonlight-xbox streams at (4K60 at ~220 Mbps is ~460 KB a frame), 99.6% of the
+// 32x32 blocks of level 0 and ~80% of level 1 carry no coefficients, and in the
+// console's hevcPlayback partition writing and re-reading their zeros cost more than
+// everything else the dequant did. Coarser levels are small and latency-bound, where
+// the iDWT's emptiness lookups would cost more than the zeros. Bit 31 of the iDWT's
+// block_stride says so.
+constexpr int SkipEmptyBlocksBelowLevel = 2;
+constexpr uint32_t IdwtCheckEmptyBlocks = 0x80000000u;
+static_assert(sizeof(DequantPush) <= RootConstantCount * 4, "DequantPush too large.");
+
+struct IdwtPush
+{
+	int32_t resolution[2];
+	float inv_resolution[2];
+	// Xbox iDWT only: block offset table entries of the HL, LH and HH band, and the
+	// band width in 32x32 blocks (xbox/idwt.hlsl reads empty blocks as zero).
+	uint32_t detail_block_offset[3];
+	uint32_t block_stride;
+};
+static_assert(sizeof(IdwtPush) <= RootConstantCount * 4, "IdwtPush too large.");
+
+// How many decodes a caller may have in flight before recording one waits for the
+// oldest to complete on the GPU.
+constexpr UINT UploadSlotCount = 4;
+
+// Per-slot descriptors, rewritten each time the slot is reused:
+//   t1 offsets (raw), t2 payload R32, t3 payload R16, t4 payload R8, t5 payload raw,
+//   then 3 plane UAVs.
+constexpr UINT SlotPayloadDescriptors = 5;
+constexpr UINT SlotDescriptorCount = SlotPayloadDescriptors + 3;
+
+// The dequant shader can read slightly past the end of the payload, so pad.
+constexpr UINT64 PayloadPadding = 16;
+
+// PYROWAVE_D3D12_PROFILE=1: timestamps around every stage, logged once the GPU is done.
+constexpr UINT ProfileMarksPerSlot = 16;
+
+struct UploadSlot
+{
+	ComPtr<ID3D12Resource> buffer;
+	UINT64 capacity = 0;
+	ComPtr<ID3D12Fence> fence;
+	UINT64 fence_value = 0;
+
+	UINT num_marks = 0;
+	const char *mark_names[ProfileMarksPerSlot] = {};
+};
+}
+
+struct pyrowave_d3d12_decoder_opaque
+{
+	pyrowave_d3d12_device device = nullptr;
+
+	BlockLayout layout;
+	BitstreamParser parser;
+
+	ComPtr<ID3D12Resource> wavelet;
+	DXGI_FORMAT wavelet_format = DXGI_FORMAT_UNKNOWN;
+
+	ComPtr<ID3D12DescriptorHeap> heap;
+	D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu = {};
+	D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu = {};
+	HANDLE wait_event = nullptr;
+
+	UploadSlot slots[UploadSlotCount];
+	UINT next_slot = 0;
+
+	bool profile = false;
+	ComPtr<ID3D12QueryHeap> timestamps;
+	ComPtr<ID3D12Resource> timestamp_readback;
+	UINT64 timestamp_frequency = 0;
+
+	// Static descriptor indices.
+	UINT pyramid_uav(int component, int level) const { return (component * DecompositionLevels + level) * 4 + 0; }
+	UINT pyramid_srv(int component, int level) const { return (component * DecompositionLevels + level) * 4 + 1; }
+	UINT ll_uav(int component, int level) const { return (component * DecompositionLevels + level) * 4 + 2; }
+	// The same as pyramid_srv as raw 16-bit integers, for the Xbox iDWT.
+	UINT pyramid_srv_raw(int component, int level) const { return (component * DecompositionLevels + level) * 4 + 3; }
+	static constexpr UINT StaticDescriptorCount = NumComponents * DecompositionLevels * 4;
+	UINT slot_base(UINT slot) const { return StaticDescriptorCount + slot * SlotDescriptorCount; }
+
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT index) const
+	{
+		return { heap_cpu.ptr + SIZE_T(index) * device->descriptor_size };
+	}
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const
+	{
+		return { heap_gpu.ptr + UINT64(index) * device->descriptor_size };
+	}
+
+	UINT subresource(int level, int layer) const
+	{
+		return UINT(level) + UINT(layer) * DecompositionLevels;
+	}
+
+	~pyrowave_d3d12_decoder_opaque()
+	{
+		for (auto &slot : slots)
+			wait_slot(slot);
+		if (wait_event)
+			CloseHandle(wait_event);
+	}
+
+	void wait_slot(UploadSlot &slot)
+	{
+		if (!slot.fence || slot.fence->GetCompletedValue() >= slot.fence_value)
+			return;
+		// Returns immediately unless the caller really is UploadSlotCount frames ahead.
+		if (SUCCEEDED(slot.fence->SetEventOnCompletion(slot.fence_value, wait_event)))
+			WaitForSingleObject(wait_event, INFINITE);
+	}
+};
+
+namespace
+{
+void mark(pyrowave_d3d12_decoder decoder, ID3D12GraphicsCommandList *cmd, UINT slot_index, const char *name)
+{
+	auto &slot = decoder->slots[slot_index];
+	if (!decoder->timestamps || slot.num_marks >= ProfileMarksPerSlot)
+		return;
+	slot.mark_names[slot.num_marks] = name;
+	cmd->EndQuery(decoder->timestamps.get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_index * ProfileMarksPerSlot + slot.num_marks++);
+}
+
+// Called once the slot's fence has completed.
+void log_profile(pyrowave_d3d12_decoder decoder, UINT slot_index)
+{
+	auto &slot = decoder->slots[slot_index];
+	if (!decoder->timestamps || slot.num_marks < 2)
+		return;
+
+	const UINT64 *ts = nullptr;
+	D3D12_RANGE range = { slot_index * ProfileMarksPerSlot * sizeof(UINT64), (slot_index + 1) * ProfileMarksPerSlot * sizeof(UINT64) };
+	if (FAILED(decoder->timestamp_readback->Map(0, &range, (void **)&ts)))
+		return;
+	ts += slot_index * ProfileMarksPerSlot;
+
+	const double to_us = 1e6 / double(decoder->timestamp_frequency);
+	char line[768];
+	int len = snprintf(line, sizeof(line), "decode profile total %.1f us:", double(ts[slot.num_marks - 1] - ts[0]) * to_us);
+	for (UINT i = 1; i < slot.num_marks && len < int(sizeof(line)); i++)
+		len += snprintf(line + len, sizeof(line) - len, " %s %.1f", slot.mark_names[i], double(ts[i] - ts[i - 1]) * to_us);
+
+	D3D12_RANGE none = { 0, 0 };
+	decoder->timestamp_readback->Unmap(0, &none);
+	decoder->device->log("%s", line);
+	slot.num_marks = 0;
+}
+
+bool init_profiling(pyrowave_d3d12_decoder decoder)
+{
+	auto *dev = decoder->device->dev.get();
+
+	// The timestamp frequency is a queue property; a throwaway compute queue tells us.
+	D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+	queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+	ComPtr<ID3D12CommandQueue> queue;
+	if (FAILED(dev->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue), queue.ppv())) ||
+	    FAILED(queue->GetTimestampFrequency(&decoder->timestamp_frequency)))
+		return false;
+
+	D3D12_QUERY_HEAP_DESC qh = {};
+	qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+	qh.Count = UploadSlotCount * ProfileMarksPerSlot;
+	if (FAILED(dev->CreateQueryHeap(&qh, __uuidof(ID3D12QueryHeap), decoder->timestamps.ppv())))
+		return false;
+
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = qh.Count * sizeof(UINT64);
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	if (FAILED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+	                                        __uuidof(ID3D12Resource), decoder->timestamp_readback.ppv())))
+	{
+		decoder->timestamps = nullptr;
+		return false;
+	}
+	return true;
+}
+
+bool create_wavelet_pyramid(pyrowave_d3d12_decoder decoder)
+{
+	auto *device = decoder->device;
+	auto &layout = decoder->layout;
+	decoder->wavelet_format = wavelet_format(device->precision);
+
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = UINT64(layout.aligned_width / 2);
+	desc.Height = UINT(layout.aligned_height / 2);
+	desc.DepthOrArraySize = UINT16(NumFrequencyBandsPerLevel * NumComponents);
+	desc.MipLevels = UINT16(DecompositionLevels);
+	// Typeless so the Xbox iDWT can gather the FP16 bits as R16_UINT.
+	const bool raw_view = decoder->wavelet_format == DXGI_FORMAT_R16_FLOAT;
+	desc.Format = raw_view ? DXGI_FORMAT_R16_TYPELESS : decoder->wavelet_format;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+	             // No compression: otherwise every UAV <-> SRV transition of the iDWT
+	             // decompresses the level (AMD: iDWT 203 -> 100 us at 4K 4:4:4).
+	             D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+
+	if (FAILED(device->dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+	                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
+	                                                __uuidof(ID3D12Resource), decoder->wavelet.ppv())))
+	{
+		device->log("Failed to allocate the wavelet pyramid.");
+		return false;
+	}
+	decoder->wavelet->SetName(L"pyrowave wavelet pyramid");
+
+	for (int component = 0; component < NumComponents; component++)
+	{
+		for (int level = 0; level < DecompositionLevels; level++)
+		{
+			const UINT first_layer = UINT(NumFrequencyBandsPerLevel * component);
+
+			// All four bands of a component at one level, written by dequant.
+			D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+			uav.Format = decoder->wavelet_format;
+			uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+			uav.Texture2DArray.MipSlice = UINT(level);
+			uav.Texture2DArray.FirstArraySlice = first_layer;
+			uav.Texture2DArray.ArraySize = NumFrequencyBandsPerLevel;
+			device->dev->CreateUnorderedAccessView(decoder->wavelet.get(), nullptr, &uav,
+			                                       decoder->cpu(decoder->pyramid_uav(component, level)));
+
+			// The same, sampled by the iDWT.
+			D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+			srv.Format = decoder->wavelet_format;
+			srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			srv.Texture2DArray.MostDetailedMip = UINT(level);
+			srv.Texture2DArray.MipLevels = 1;
+			srv.Texture2DArray.FirstArraySlice = first_layer;
+			srv.Texture2DArray.ArraySize = NumFrequencyBandsPerLevel;
+			device->dev->CreateShaderResourceView(decoder->wavelet.get(), &srv,
+			                                      decoder->cpu(decoder->pyramid_srv(component, level)));
+
+			// Band 0 (LL) only, written by the iDWT of the level above.
+			uav.Texture2DArray.ArraySize = 1;
+			device->dev->CreateUnorderedAccessView(decoder->wavelet.get(), nullptr, &uav,
+			                                       decoder->cpu(decoder->ll_uav(component, level)));
+
+			srv.Format = raw_view ? DXGI_FORMAT_R16_UINT : decoder->wavelet_format;
+			device->dev->CreateShaderResourceView(decoder->wavelet.get(), &srv,
+			                                      decoder->cpu(decoder->pyramid_srv_raw(component, level)));
+		}
+	}
+
+	return true;
+}
+
+bool ensure_slot_buffer(pyrowave_d3d12_decoder decoder, UploadSlot &slot, UINT64 size)
+{
+	if (slot.buffer && slot.capacity >= size)
+		return true;
+
+	// Overallocate so a steadily sized stream stops reallocating.
+	UINT64 allocate = size * 2;
+	if (allocate < 64 * 1024)
+		allocate = 64 * 1024;
+
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = allocate;
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	slot.buffer = nullptr;
+	slot.capacity = 0;
+	if (FAILED(decoder->device->dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+	                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+	                                                         __uuidof(ID3D12Resource), slot.buffer.ppv())))
+	{
+		decoder->device->log("Failed to allocate a %llu byte upload buffer.", static_cast<unsigned long long>(allocate));
+		return false;
+	}
+
+	slot.buffer->SetName(L"pyrowave decoder upload");
+
+	slot.capacity = allocate;
+	return true;
+}
+
+void write_payload_descriptors(pyrowave_d3d12_decoder decoder, UINT slot_index, UINT64 offsets_size,
+                               UINT64 payload_offset, UINT64 payload_size)
+{
+	auto *dev = decoder->device->dev.get();
+	auto *buffer = decoder->slots[slot_index].buffer.get();
+	const UINT base = decoder->slot_base(slot_index);
+
+	// t1: dequant offsets, raw.
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+	srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Format = DXGI_FORMAT_R32_TYPELESS;
+	srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+	srv.Buffer.FirstElement = 0;
+	srv.Buffer.NumElements = UINT(offsets_size / 4 ? offsets_size / 4 : 1);
+	dev->CreateShaderResourceView(buffer, &srv, decoder->cpu(base + 0));
+
+	// t2..t4: the same payload bytes as R32, R16 and R8 texel buffers.
+	static const struct { DXGI_FORMAT format; UINT size; } views[3] = {
+		{ DXGI_FORMAT_R32_UINT, 4 }, { DXGI_FORMAT_R16_UINT, 2 }, { DXGI_FORMAT_R8_UINT, 1 },
+	};
+	for (UINT i = 0; i < 3; i++)
+	{
+		srv.Format = views[i].format;
+		srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+		srv.Buffer.FirstElement = payload_offset / views[i].size;
+		srv.Buffer.NumElements = UINT(payload_size / views[i].size);
+		dev->CreateShaderResourceView(buffer, &srv, decoder->cpu(base + 1 + i));
+	}
+
+	// t5: the payload again, raw, for the Xbox dequant kernel.
+	srv.Format = DXGI_FORMAT_R32_TYPELESS;
+	srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+	srv.Buffer.FirstElement = payload_offset / 4;
+	srv.Buffer.NumElements = UINT(payload_size / 4);
+	dev->CreateShaderResourceView(buffer, &srv, decoder->cpu(base + 4));
+}
+
+bool write_plane_descriptors(pyrowave_d3d12_decoder decoder, UINT slot_index, ID3D12Resource *const planes[3])
+{
+	auto &layout = decoder->layout;
+	auto *device = decoder->device;
+	const bool chroma_420 = layout.chroma == ChromaSubsampling::Chroma420;
+
+	for (int i = 0; i < 3; i++)
+	{
+		if (!planes[i])
+		{
+			device->log("Output plane %d is NULL.", i);
+			return false;
+		}
+
+		const D3D12_RESOURCE_DESC desc = planes[i]->GetDesc();
+		const int expected_width = i == 0 || !chroma_420 ? layout.width : layout.width / 2;
+		const int expected_height = i == 0 || !chroma_420 ? layout.height : layout.height / 2;
+
+		if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+		    desc.SampleDesc.Count != 1)
+		{
+			device->log("Output plane %d must be a single-sampled, non-array 2D texture.", i);
+			return false;
+		}
+
+		if (int(desc.Width) != expected_width || int(desc.Height) != expected_height)
+		{
+			device->log("Output plane %d is %llux%u, expected %dx%d.", i,
+			            static_cast<unsigned long long>(desc.Width), desc.Height, expected_width, expected_height);
+			return false;
+		}
+
+		if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
+		{
+			device->log("Output plane %d lacks D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.", i);
+			return false;
+		}
+
+		// The shader declares a one-layer array so the same UAV type also fits the
+		// pyramid's LL slices; an array view of a non-array texture is valid.
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+		uav.Format = desc.Format;
+		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+		uav.Texture2DArray.ArraySize = 1;
+		device->dev->CreateUnorderedAccessView(planes[i], nullptr, &uav,
+		                                       decoder->cpu(decoder->slot_base(slot_index) + SlotPayloadDescriptors + i));
+	}
+
+	return true;
+}
+
+// One dequant dispatch: a (component, level, band) region of the pyramid. None reads
+// another's output, so no barriers are needed between them.
+struct DequantJob
+{
+	int component, level, band;
+};
+
+std::vector<DequantJob> dequant_jobs(const BlockLayout &layout, int level)
+{
+	std::vector<DequantJob> jobs;
+	for (int component = 0; component < NumComponents; component++)
+	{
+		// Ignore top-level CbCr when doing 420 subsampling.
+		if (level == 0 && component != 0 && layout.chroma == ChromaSubsampling::Chroma420)
+			continue;
+		for (int band = (level == DecompositionLevels - 1 ? 0 : 1); band < 4; band++)
+			jobs.push_back({ component, level, band });
+	}
+	return jobs;
+}
+
+void record_dequant(pyrowave_d3d12_decoder decoder, ID3D12GraphicsCommandList *cmd, UINT slot_index,
+                    const DequantJob *jobs, size_t count)
+{
+	auto &layout = decoder->layout;
+	cmd->SetPipelineState(decoder->device->dequant_pipeline.get());
+	cmd->SetComputeRootDescriptorTable(RootTableT1ToT5, decoder->gpu(decoder->slot_base(slot_index)));
+	for (size_t i = 0; i < count; i++)
+	{
+		const auto &job = jobs[i];
+		cmd->SetComputeRootDescriptorTable(RootTableU0, decoder->gpu(decoder->pyramid_uav(job.component, job.level)));
+		DequantPush push = {};
+		push.resolution[0] = layout.level_width(job.level);
+		push.resolution[1] = layout.level_height(job.level);
+		push.output_layer = job.band;
+		push.block_offset_32x32 = layout.block_meta[job.component][job.level][job.band].block_offset_32x32;
+		push.block_stride_32x32 = layout.block_meta[job.component][job.level][job.band].block_stride_32x32;
+		push.skip_empty_blocks = decoder->device->xbox_kernels && job.level < SkipEmptyBlocksBelowLevel && job.band != 0;
+		cmd->SetComputeRoot32BitConstants(RootConstants, sizeof(push) / 4, &push, 0);
+		cmd->Dispatch(UINT(push.resolution[0] + 31) / 32, UINT(push.resolution[1] + 31) / 32, 1);
+	}
+}
+
+void transition_level(pyrowave_d3d12_decoder decoder, ID3D12GraphicsCommandList *cmd, int level,
+                      D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+	D3D12_RESOURCE_BARRIER barriers[NumComponents * NumFrequencyBandsPerLevel] = {};
+	for (int layer = 0; layer < NumComponents * NumFrequencyBandsPerLevel; layer++)
+	{
+		auto &b = barriers[layer];
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = decoder->wavelet.get();
+		b.Transition.Subresource = decoder->subresource(level, layer);
+		b.Transition.StateBefore = before;
+		b.Transition.StateAfter = after;
+	}
+	cmd->ResourceBarrier(UINT(NumComponents * NumFrequencyBandsPerLevel), barriers);
+}
+
+void record_idwt_dispatch(pyrowave_d3d12_decoder decoder, ID3D12GraphicsCommandList *cmd, IdwtPush push,
+                          int component, int level, UINT input_srv, UINT output_uav, bool dc_shift)
+{
+	for (int band = 1; band < NumFrequencyBandsPerLevel; band++)
+		push.detail_block_offset[band - 1] = uint32_t(decoder->layout.block_meta[component][level][band].block_offset_32x32);
+	push.block_stride = uint32_t(decoder->layout.block_meta[component][level][1].block_stride_32x32) |
+	                    (level < SkipEmptyBlocksBelowLevel ? IdwtCheckEmptyBlocks : 0u);
+	cmd->SetPipelineState(decoder->device->idwt_pipeline[dc_shift ? 1 : 0].get());
+	cmd->SetComputeRoot32BitConstants(RootConstants, sizeof(push) / 4, &push, 0);
+	cmd->SetComputeRootDescriptorTable(RootTableT0, decoder->gpu(input_srv));
+	cmd->SetComputeRootDescriptorTable(RootTableU1, decoder->gpu(output_uav));
+	if (decoder->device->xbox_kernels)
+	{
+		// Band size in, 2x the band size out, in XboxIdwtTile-sized tiles.
+		cmd->Dispatch(UINT(2 * push.resolution[0] + XboxIdwtTileWidth - 1) / XboxIdwtTileWidth,
+		              UINT(2 * push.resolution[1] + XboxIdwtTileHeight - 1) / XboxIdwtTileHeight, 1);
+	}
+	else
+		cmd->Dispatch(UINT(push.resolution[0] + 15) / 16, UINT(push.resolution[1] + 15) / 16, 1);
+}
+
+// Dequantizes and reconstructs the frame.
+//
+// The order is tuned for the Xbox media-app partition (see xbox_kernel_model), where
+// it saved ~60 us of 1.8 ms; it costs nothing elsewhere. Each iDWT level needs only
+// its own bands dequantized, and the coarse levels are latency-bound (few groups, a
+// long dependency chain per group) while dequant is bound by memory writes, so the
+// dequant of finer levels is interleaved with the iDWT of coarser ones instead of all
+// running up front: level 2's with the level 4 iDWT, level 1's with level 3's, and
+// level 0's, the bulk, split over levels 2 and 1. The barrier in front of each iDWT
+// level waits for everything before it, so whatever it needs is complete, and
+// dispatches between two barriers share the GPU.
+void record_decode(pyrowave_d3d12_decoder decoder, ID3D12GraphicsCommandList *cmd, UINT slot_index)
+{
+	auto &layout = decoder->layout;
+	const bool chroma_420 = layout.chroma == ChromaSubsampling::Chroma420;
+	const UINT plane_base = decoder->slot_base(slot_index) + SlotPayloadDescriptors;
+
+	// Resting state is COMMON (simultaneous-access resources decay to it anyway).
+	D3D12_RESOURCE_BARRIER to_uav = {};
+	to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_uav.Transition.pResource = decoder->wavelet.get();
+	to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	cmd->ResourceBarrier(1, &to_uav);
+	// The payload tables: dequant reads them all, the Xbox iDWT the block offsets.
+	cmd->SetComputeRootDescriptorTable(RootTableT1ToT5, decoder->gpu(decoder->slot_base(slot_index)));
+
+	// What to dequantize alongside each iDWT level (index: input level).
+	static_assert(DecompositionLevels == 5, "The dequant/iDWT interleaving below assumes five levels.");
+	std::vector<DequantJob> overlap[DecompositionLevels];
+	{
+		auto first = dequant_jobs(layout, DecompositionLevels - 1);
+		auto second = dequant_jobs(layout, DecompositionLevels - 2);
+		first.insert(first.end(), second.begin(), second.end());
+		record_dequant(decoder, cmd, slot_index, first.data(), first.size());
+		mark(decoder, cmd, slot_index, "dequant");
+
+		overlap[4] = dequant_jobs(layout, 2);
+		overlap[3] = dequant_jobs(layout, 1);
+		auto finest = dequant_jobs(layout, 0);
+		const size_t split = finest.size() / 3;
+		overlap[2].assign(finest.begin(), finest.begin() + ptrdiff_t(split));
+		overlap[1].assign(finest.begin() + ptrdiff_t(split), finest.end());
+	}
+
+	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
+	{
+		// Levels are a dependent chain: this one samples the LL band the previous one
+		// wrote. The transition is both the state change and the write->read barrier.
+		transition_level(decoder, cmd, input_level, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+		IdwtPush push = {};
+		// idwt.comp transposes on load, so resolution is swapped for it; the Xbox
+		// kernel takes the band size as is.
+		const bool xbox = decoder->device->xbox_kernels;
+		push.resolution[0] = xbox ? layout.level_width(input_level) : layout.level_height(input_level);
+		push.resolution[1] = xbox ? layout.level_height(input_level) : layout.level_width(input_level);
+		push.inv_resolution[0] = 1.0f / float(push.resolution[0]);
+		push.inv_resolution[1] = 1.0f / float(push.resolution[1]);
+
+		auto input = [&](int c) {
+			return xbox ? decoder->pyramid_srv_raw(c, input_level) : decoder->pyramid_srv(c, input_level);
+		};
+		if (input_level == 0)
+		{
+			// Final level writes the output planes directly. Under 420 the chroma
+			// planes were already finished one level earlier.
+			const int components = chroma_420 ? 1 : NumComponents;
+			for (int c = 0; c < components; c++)
+				record_idwt_dispatch(decoder, cmd, push, c, input_level, input(c), plane_base + c, true);
+		}
+		else
+		{
+			for (int c = 0; c < NumComponents; c++)
+			{
+				const bool final_chroma = chroma_420 && c != 0 && input_level == 1;
+				const UINT output = final_chroma ? plane_base + c : decoder->ll_uav(c, input_level - 1);
+				record_idwt_dispatch(decoder, cmd, push, c, input_level, input(c), output, final_chroma);
+			}
+		}
+
+		// The idwt dispatches go first so the level's latency-bound groups launch first.
+		record_dequant(decoder, cmd, slot_index, overlap[input_level].data(), overlap[input_level].size());
+
+		static const char *const names[] = { "idwt0", "idwt1+dq0b", "idwt2+dq0a", "idwt3+dq1", "idwt4+dq2" };
+		mark(decoder, cmd, slot_index, names[input_level]);
+	}
+
+	// Back to the resting state. Every level ended up in NON_PIXEL_SHADER_RESOURCE, so
+	// one all-subresource barrier does (a third of the cost of one per subresource on
+	// Xbox). Implicit decay would make it free, but only if no second decode followed
+	// in the same command list.
+	D3D12_RESOURCE_BARRIER rest = {};
+	rest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	rest.Transition.pResource = decoder->wavelet.get();
+	rest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	rest.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	rest.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	cmd->ResourceBarrier(1, &rest);
+}
+}
+
+//////
+// Public API
+
+pyrowave_d3d12_result pyrowave_d3d12_decoder_create(const pyrowave_d3d12_decoder_create_info *info,
+                                                    pyrowave_d3d12_decoder *decoder)
+{
+	if (!info || !decoder || !info->device)
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+
+	if (info->chroma != PYROWAVE_D3D12_CHROMA_SUBSAMPLING_420 &&
+	    info->chroma != PYROWAVE_D3D12_CHROMA_SUBSAMPLING_444)
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+
+	const bool chroma_420 = info->chroma == PYROWAVE_D3D12_CHROMA_SUBSAMPLING_420;
+	if (chroma_420 && ((info->width & 1) != 0 || (info->height & 1) != 0))
+	{
+		info->device->log("420 subsampling requires even dimensions, got %dx%d.", info->width, info->height);
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+	}
+
+	auto created = std::unique_ptr<pyrowave_d3d12_decoder_opaque>(new (std::nothrow) pyrowave_d3d12_decoder_opaque);
+	if (!created)
+		return PYROWAVE_D3D12_ERROR_OUT_OF_HOST_MEMORY;
+
+	created->device = info->device;
+	if (!created->layout.init(info->width, info->height,
+	                          chroma_420 ? ChromaSubsampling::Chroma420 : ChromaSubsampling::Chroma444))
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+	created->parser.init(&created->layout);
+
+	created->wait_event = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+	if (!created->wait_event)
+		return PYROWAVE_D3D12_ERROR_GENERIC;
+
+	D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heap_desc.NumDescriptors = pyrowave_d3d12_decoder_opaque::StaticDescriptorCount + UploadSlotCount * SlotDescriptorCount;
+	heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	if (FAILED(created->device->dev->CreateDescriptorHeap(&heap_desc, __uuidof(ID3D12DescriptorHeap),
+	                                                      created->heap.ppv())))
+	{
+		created->device->log("Failed to create the descriptor heap.");
+		return PYROWAVE_D3D12_ERROR_OUT_OF_DEVICE_MEMORY;
+	}
+	created->heap_cpu = created->heap->GetCPUDescriptorHandleForHeapStart();
+	created->heap_gpu = created->heap->GetGPUDescriptorHandleForHeapStart();
+
+	if (!create_wavelet_pyramid(created.get()))
+		return PYROWAVE_D3D12_ERROR_OUT_OF_DEVICE_MEMORY;
+
+	const char *profile_env = getenv("PYROWAVE_D3D12_PROFILE");
+	if (profile_env && profile_env[0] == '1' && !init_profiling(created.get()))
+		created->device->log("Decoder profiling unavailable.");
+
+	*decoder = created.release();
+	return PYROWAVE_D3D12_SUCCESS;
+}
+
+void pyrowave_d3d12_decoder_destroy(pyrowave_d3d12_decoder decoder)
+{
+	delete decoder;
+}
+
+void pyrowave_d3d12_decoder_clear(pyrowave_d3d12_decoder decoder)
+{
+	if (decoder)
+		decoder->parser.clear();
+}
+
+pyrowave_d3d12_result pyrowave_d3d12_decoder_push_packet(pyrowave_d3d12_decoder decoder, const void *data, size_t size)
+{
+	if (!decoder || (!data && size != 0))
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+
+	if (!decoder->parser.push_packet(data, size))
+		return PYROWAVE_D3D12_ERROR_CORRUPT_BITSTREAM;
+
+	return PYROWAVE_D3D12_SUCCESS;
+}
+
+pyrowave_d3d12_result pyrowave_d3d12_decoder_push_packet_truncated(pyrowave_d3d12_decoder decoder, const void *data,
+                                                                   size_t size)
+{
+	if (!decoder || (!data && size != 0))
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+
+	if (!decoder->parser.push_packet(data, size, true))
+		return PYROWAVE_D3D12_ERROR_CORRUPT_BITSTREAM;
+
+	return PYROWAVE_D3D12_SUCCESS;
+}
+
+bool pyrowave_d3d12_decoder_decode_is_ready(pyrowave_d3d12_decoder decoder, bool allow_partial_frame)
+{
+	return decoder && decoder->parser.decode_is_ready(allow_partial_frame);
+}
+
+bool pyrowave_d3d12_decoder_decode_is_ready_prefix(pyrowave_d3d12_decoder decoder, bool allow_partial_frame)
+{
+	return decoder && decoder->parser.decode_is_ready_prefix(allow_partial_frame);
+}
+
+void pyrowave_d3d12_decoder_get_block_counts(pyrowave_d3d12_decoder decoder, int *decoded_blocks, int *total_blocks)
+{
+	if (decoded_blocks)
+		*decoded_blocks = decoder ? decoder->parser.get_decoded_blocks() : 0;
+	if (total_blocks)
+		*total_blocks = decoder ? decoder->parser.get_total_blocks_in_sequence() : 0;
+}
+
+bool pyrowave_d3d12_decoder_decode_is_ready_with_sideband(pyrowave_d3d12_decoder decoder, bool allow_partial_frame,
+                                                          int num_pristine_bands, float minimum_packet_ratio,
+                                                          const uint32_t *active_block_mask, size_t word_count)
+{
+	if (!decoder)
+		return false;
+	return decoder->parser.decode_is_ready(allow_partial_frame, num_pristine_bands, minimum_packet_ratio,
+	                                       active_block_mask, word_count);
+}
+
+pyrowave_d3d12_result pyrowave_d3d12_decoder_decode_gpu_buffer(pyrowave_d3d12_decoder decoder,
+                                                               ID3D12GraphicsCommandList *command_list,
+                                                               const pyrowave_d3d12_gpu_buffers *buffers,
+                                                               ID3D12Fence *completion_fence,
+                                                               uint64_t completion_value)
+{
+	if (!decoder || !command_list || !buffers || !completion_fence)
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+
+	const UINT slot_index = decoder->next_slot;
+	auto &slot = decoder->slots[slot_index];
+	// Applies back pressure rather than growing the ring.
+	decoder->wait_slot(slot);
+	log_profile(decoder, slot_index);
+
+	const auto &offsets = decoder->parser.dequant_offsets();
+	const auto &payload = decoder->parser.payload();
+	const UINT64 offsets_size = offsets.size() * sizeof(uint32_t);
+	const UINT64 payload_offset = (offsets_size + 255) & ~UINT64(255);
+	const UINT64 payload_size = payload.size() * sizeof(uint32_t) + PayloadPadding;
+
+	if (!ensure_slot_buffer(decoder, slot, payload_offset + payload_size))
+		return PYROWAVE_D3D12_ERROR_OUT_OF_DEVICE_MEMORY;
+	if (!write_plane_descriptors(decoder, slot_index, buffers->planes))
+		return PYROWAVE_D3D12_ERROR_INVALID_ARGUMENT;
+
+	uint8_t *mapped = nullptr;
+	D3D12_RANGE no_read = { 0, 0 };
+	if (FAILED(slot.buffer->Map(0, &no_read, reinterpret_cast<void **>(&mapped))))
+		return PYROWAVE_D3D12_ERROR_GENERIC;
+	if (offsets_size)
+		memcpy(mapped, offsets.data(), offsets_size);
+	if (!payload.empty())
+		memcpy(mapped + payload_offset, payload.data(), payload.size() * sizeof(uint32_t));
+	memset(mapped + payload_offset + payload.size() * sizeof(uint32_t), 0, PayloadPadding);
+	slot.buffer->Unmap(0, nullptr);
+
+	write_payload_descriptors(decoder, slot_index, offsets_size, payload_offset, payload_size);
+
+	ID3D12DescriptorHeap *heaps[] = { decoder->heap.get() };
+	command_list->SetDescriptorHeaps(1, heaps);
+	command_list->SetComputeRootSignature(decoder->device->root_signature.get());
+
+	mark(decoder, command_list, slot_index, "start");
+	record_decode(decoder, command_list, slot_index);
+
+	D3D12_RESOURCE_BARRIER uav_barriers[3] = {};
+	for (int i = 0; i < 3; i++)
+	{
+		uav_barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		uav_barriers[i].UAV.pResource = buffers->planes[i];
+	}
+	command_list->ResourceBarrier(3, uav_barriers);
+
+	if (decoder->timestamps && slot.num_marks)
+	{
+		mark(decoder, command_list, slot_index, "end");
+		command_list->ResolveQueryData(decoder->timestamps.get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_index * ProfileMarksPerSlot,
+		                               slot.num_marks, decoder->timestamp_readback.get(),
+		                               slot_index * ProfileMarksPerSlot * sizeof(UINT64));
+	}
+
+	// Held until this slot comes round again.
+	completion_fence->AddRef();
+	slot.fence = completion_fence;
+	slot.fence_value = completion_value;
+	decoder->next_slot = (slot_index + 1) % UploadSlotCount;
+
+	decoder->parser.mark_frame_decoded();
+	return PYROWAVE_D3D12_SUCCESS;
+}
